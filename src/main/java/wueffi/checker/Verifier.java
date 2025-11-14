@@ -6,23 +6,30 @@ import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
+import net.minecraft.text.ClickEvent;
+import net.minecraft.text.Style;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.RepeaterBlock;
 import net.minecraft.text.Text;
 import net.minecraft.world.tick.TickManager;
+import wueffi.checker.helpers.BoardFormatter;
 import wueffi.checker.helpers.ValidBoardGenerator;
 
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.Random;
 
 import static wueffi.checker.competitionchecker.server;
+import static wueffi.checker.competitionchecker.LOGGER;
 
 public class Verifier {
 
     private static final List<VerificationTask> activeTasks = new ArrayList<>();
+    private static final Random random = new Random();
+    private static String name;
     private static ServerPlayerEntity player;
 
     public static void init() {
@@ -31,25 +38,23 @@ public class Verifier {
         });
     }
 
-    public static void verify(PlayerEntity player1, String name) {
+    public static void verify(PlayerEntity player1, String name, int count, boolean seeded, long seed) {
         BlockPos nwbCorner = BlockSelectListener.getPositions().get(name);
         if (nwbCorner == null) return;
 
+        Verifier.name = name;
         player = server.getPlayerManager().getPlayer(player1.getUuid());
         if (player == null) return;
 
         ServerWorld world = player.getWorld();
         if (world == null) return;
 
-        int[][] board = ValidBoardGenerator.generateBoard();
-        setInputs(world, nwbCorner, board);
-
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-        scheduler.schedule(() -> activeTasks.add(new VerificationTask(player, world, nwbCorner)), 50, TimeUnit.MILLISECONDS);
+        scheduler.schedule(() -> activeTasks.add(new VerificationTask(player, world, nwbCorner, count, seeded, seed)), 50, TimeUnit.MILLISECONDS);
     }
 
     private static void setInputs(ServerWorld world, BlockPos nwbCorner, int[][] gameState) {
-        player.sendMessage(Text.literal("§7[CC-DEBUG] Setting inputs..."), false);
+        //player.sendMessage(Text.literal("§7[CC-DEBUG] Setting inputs..."), false);
 
         int startX = nwbCorner.getX() - 1;
         int startY = nwbCorner.getY() + 26;
@@ -70,92 +75,105 @@ public class Verifier {
     }
 
     private static class VerificationTask {
-        private static final int TOTAL_TICKS = 600;
-        private static final int CHECK_INTERVAL = 2;
+        private static final int TEST_TICKS = 600;
 
         private final ServerPlayerEntity player;
         private final ServerWorld world;
         private final BlockPos corner;
-        private final boolean[] originalOutput;
-        private final boolean[] firstOutput = new boolean[7];
-        private final boolean[] finalOutput = new boolean[7];
+        private final int testCount;
+        private final long[] testSeeds;
+        private final int[] results;
+        private int[][] board = new int[0][];
 
         private int tickCounter = 0;
-        private int ticksUntilFirstOutput = -1;
+        private int testCounter = 0;
 
-        VerificationTask(ServerPlayerEntity player, ServerWorld world, BlockPos corner) {
+        VerificationTask(ServerPlayerEntity player, ServerWorld world, BlockPos corner, int count, boolean seeded, long seed) {
             this.player = player;
             this.world = world;
             this.corner = corner;
-            this.originalOutput = readOutputs(world, corner);
+            if (seeded) {
+                testCount = 1;
+                testSeeds = new long[] {seed};
+                results = new int[1];
+            }
+            else {
+                testCount = count;
+                testSeeds = new long[count];
+                for (int i = 0; i < count; i++) testSeeds[i] = random.nextLong();
+                results = new int[count];
+
+                // speed up the game for the duration of the tests
+                ServerCommandSource source = player.getCommandSource();
+                String command = "tick sprint " + TEST_TICKS * testCount;
+                ParseResults<ServerCommandSource> parse = player.getServer().getCommandManager().getDispatcher().parse(command, source);
+                player.getServer().getCommandManager().execute(parse, command);
+            }
         }
 
         boolean tick(ServerWorld server) {
             if (!world.getRegistryKey().equals(server.getServer().getOverworld().getRegistryKey())) return true;
 
             if (tickCounter == 0) {
-                ServerCommandSource source = player.getCommandSource();
 
-                String command = "tick rate 1200";
-                ParseResults<ServerCommandSource> parse = player.getServer().getCommandManager().getDispatcher().parse(command, source);
-
-                player.getServer().getCommandManager().execute(parse, command);
+                // generate a board to verify
+                board = ValidBoardGenerator.generateBoard(testSeeds[testCounter]);
+                // test using the board
+                LOGGER.info("testing board:\n" + BoardFormatter.format(board));
+                setInputs(world, corner, board);
             }
-
-            int originalOutputs = 0;
-            for (boolean b : originalOutput) if (b) originalOutputs++;
-
-            if (originalOutputs != 0) ticksUntilFirstOutput = -2;
 
             tickCounter++;
-            if (tickCounter % CHECK_INTERVAL != 0) return true;
+            if (tickCounter < TEST_TICKS) return true;
 
-            boolean[] current = readOutputs(world, corner);
-            int onCount = 0;
-            for (boolean b : current) if (b) onCount++;
+            // read the machine outputs
+            boolean[] output = readOutputs(world, corner);
 
-            if (ticksUntilFirstOutput == -1 && onCount > 0 && !Arrays.equals(current, originalOutput)) {
-                ticksUntilFirstOutput = tickCounter;
-                System.arraycopy(current, 0, firstOutput, 0, 7);
-                player.sendMessage(Text.literal("§7[CC] Output detected at " + tickCounter + " ticks (" + tickCounter/20.0 + " s)!"), false);
-            }
-
-            if (ticksUntilFirstOutput >= 0 && tickCounter > ticksUntilFirstOutput) {
-                if (!Arrays.equals(current, firstOutput)) {
-                    player.sendMessage(Text.literal("§7[CC] Output changed! Expected: " + Arrays.toString(firstOutput) + " Got: " + Arrays.toString(current)), false);
-                    return false;
+            int onCount = 0; // the number of outputs that are on (powered)
+            int outIndex = -1; // the index of the output that is on
+            boolean fullBoard = true;
+            for (int i = 0; i < output.length; i++) {
+                if (output[i]) {
+                    onCount++;
+                    outIndex = i;
                 }
+                if (board[0][i] == 0) fullBoard = false;
             }
 
-            if (tickCounter >= TOTAL_TICKS - CHECK_INTERVAL) {
-                System.arraycopy(current, 0, finalOutput, 0, 7);
-            }
+            if (fullBoard) results[testCounter] = 0; // output doesn't matter because the game is over
+            else if (onCount == 0) results[testCounter] = 1;
+            else if (onCount > 1) results[testCounter] = 2;
+            else if (board[0][outIndex] != 0) results[testCounter] = 3;
+            else results[testCounter] = 0;
 
-            if (tickCounter >= TOTAL_TICKS) {
-                ServerCommandSource source = player.getCommandSource();
+            testCounter++;
+            tickCounter = 0;
 
-                String command = "tick rate 20";
-                ParseResults<ServerCommandSource> parse = player.getServer().getCommandManager().getDispatcher().parse(command, source);
-
-                player.getServer().getCommandManager().execute(parse, command);
-
-                validateFinalOutput();
+            if (testCounter == testCount){
+                // completed all tests
+                summary();
                 return false;
             }
 
             return true;
         }
 
-        private void validateFinalOutput() {
-            int outputsOn = 0;
-            for (boolean b : finalOutput) if (b) outputsOn++;
+        private void summary() {
+            int passes = 0;
+            for (int result : results) if (result == 0) passes++;
 
-            if (ticksUntilFirstOutput == -1) player.sendMessage(Text.literal("§7[CC] No output detected within 30 seconds!"), false);
-            else if (outputsOn == 0) player.sendMessage(Text.literal("§7[CC] Output turned off by end!"), false);
-            else if (outputsOn > 1) player.sendMessage(Text.literal("§7[CC] Multiple outputs! Expected 1, got " + outputsOn), false);
-            else if (ticksUntilFirstOutput == -2) player.sendMessage(Text.literal("§7[CC] Valid output detected after 0 ticks. (0,0s)"), false);
-            else if (!Arrays.equals(finalOutput, firstOutput)) player.sendMessage(Text.literal("§7[CC] Output changed! Initial: " + Arrays.toString(firstOutput) + " Final: " + Arrays.toString(finalOutput)), false);
-            else player.sendMessage(Text.literal("§7[CC] Valid output detected after " + ticksUntilFirstOutput + " ticks (" + ticksUntilFirstOutput/20.0 + " s)"), false);
+            player.sendMessage(Text.literal("§7[CC] Passed " + passes + "/" + testCount + " test(s)"), false);
+
+            for (int i = 0; i < testCount; i++) {
+                int result = results[i];
+                String outString = "§4Unexpected result for test " + (i + 1);
+                if (result == 0) outString = "§aTest " + (i + 1) + " Passed!";
+                else if (result == 1) outString = "§cTest " + (i + 1) + " Failed. No output!";
+                else if (result == 2) outString = "§cTest " + (i + 1) + " Failed. Multiple outputs!";
+                else if (result == 3) outString = "§cTest " + (i + 1) + " Failed. Tried to play in a column that is already full!";
+
+                player.sendMessage(Text.literal("§7[CC] " + outString).setStyle(Style.EMPTY.withClickEvent(new ClickEvent.SuggestCommand("/verify " + name + " seed " + testSeeds[i]))));
+            }
         }
     }
 

@@ -9,7 +9,8 @@ import static wueffi.checker.competitionchecker.LOGGER;
 public class ValidBoardGenerator {
     private static final Random random = new Random();
 
-    public static int[][] generateBoard() {
+    public static int[][] generateBoard(long seed) {
+        random.setSeed(seed);
         int[][] board = new int[6][7];
         int redCount = 0;
         int yellowCount = 0;
